@@ -10,22 +10,28 @@ from src.types import Token, TokenType
 
 
 KEYWORDS: dict[str, TokenType] = {
-    "select": TokenType.SELECT,
-    "from":   TokenType.FROM,
-    "where":  TokenType.WHERE,
-    "group":  TokenType.GROUP_BY,   # "GROUP BY" handled as one token
-    "order":  TokenType.ORDER_BY,   # "ORDER BY" handled as one token
-    "limit":  TokenType.LIMIT,
-    "and":    TokenType.AND,
-    "or":     TokenType.OR,
-    "not":    TokenType.NOT,
-    "as":     TokenType.AS,
-    "join":   TokenType.JOIN,
-    "on":     TokenType.ON,
-    "inner":  TokenType.INNER,
-    "left":   TokenType.LEFT,
-    "like":   TokenType.LIKE,
-    "by":     None,   # consumed as part of GROUP BY / ORDER BY
+    "select":   TokenType.SELECT,
+    "from":     TokenType.FROM,
+    "where":    TokenType.WHERE,
+    "group":    TokenType.GROUP_BY,      # "GROUP BY" handled as one token
+    "order":    TokenType.ORDER_BY,      # "ORDER BY" handled as one token
+    "partition": TokenType.PARTITION_BY, # "PARTITION BY" handled as one token
+    "limit":    TokenType.LIMIT,
+    "and":      TokenType.AND,
+    "or":       TokenType.OR,
+    "not":      TokenType.NOT,
+    "as":       TokenType.AS,
+    "join":     TokenType.JOIN,
+    "on":       TokenType.ON,
+    "inner":    TokenType.INNER,
+    "left":     TokenType.LEFT,
+    "like":     TokenType.LIKE,
+    "with":     TokenType.WITH,
+    "over":     TokenType.OVER,
+    "having":   TokenType.HAVING,
+    "distinct": TokenType.DISTINCT,
+    "sample":   TokenType.SAMPLE,
+    "by":       None,   # consumed as part of GROUP/ORDER/PARTITION BY
 }
 
 AGGREGATE_FUNCTIONS = {"sum", "count", "avg", "min", "max", "count_distinct"}
@@ -107,6 +113,11 @@ class Lexer:
             if self.text[self.pos:self.pos+2].lower() == "by":
                 self.pos += 2
             return Token(TokenType.ORDER_BY, "ORDER BY", start)
+        if lower == "partition":
+            self.skip_whitespace_and_comments()
+            if self.text[self.pos:self.pos+2].lower() == "by":
+                self.pos += 2
+            return Token(TokenType.PARTITION_BY, "PARTITION BY", start)
 
         tt = KEYWORDS.get(lower)
         if tt is not None:
@@ -161,6 +172,8 @@ class Lexer:
                 self.advance(); self.tokens.append(Token(TokenType.GT, ">", pos))
             elif ch == "-":
                 self.advance(); self.tokens.append(Token(TokenType.MINUS, "-", pos))
+            elif ch == "%":
+                self.advance(); self.tokens.append(Token(TokenType.PERCENT, "%", pos))
             else:
                 raise self.error(f"Unexpected character {ch!r}")
 

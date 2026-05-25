@@ -312,3 +312,244 @@ class TestStorage:
         for row in reader.scan(columns=["a", "b"]):
             assert set(row.keys()) == {"a", "b"}
             break
+
+
+# ── New feature tests ──────────────────────────────────────────────────────
+
+class TestCTE:
+    def test_basic_cte(self, engine):
+        result = engine.query("""
+            WITH ca_orders AS (
+                SELECT * FROM orders WHERE country = 'CA'
+            )
+            SELECT * FROM ca_orders
+        """)
+        assert len(result.rows) == 3
+        assert all(r["country"] == "CA" for r in result.rows)
+
+    def test_cte_with_aggregation(self, engine):
+        result = engine.query("""
+            WITH totals AS (
+                SELECT country, SUM(total) AS rev FROM orders GROUP BY country
+            )
+            SELECT * FROM totals WHERE rev > 100
+        """)
+        # CA total = 300, US = 225, UK = 105, DE = 300
+        assert all(r["rev"] > 100 for r in result.rows)
+
+    def test_cte_in_explain(self, engine):
+        plan = engine.explain("""
+            WITH top AS (SELECT * FROM orders LIMIT 5)
+            SELECT * FROM top
+        """)
+        assert "Scan" in plan
+
+
+class TestWindowFunctions:
+    def test_row_number(self, engine):
+        result = engine.query("""
+            SELECT country, total,
+                   ROW_NUMBER() OVER (PARTITION BY country ORDER BY total DESC) AS rn
+            FROM orders
+        """)
+        # within each country partition, row numbers should start at 1
+        ca_rows = [r for r in result.rows if r["country"] == "CA"]
+        rn_values = sorted(r["rn"] for r in ca_rows)
+        assert rn_values == list(range(1, len(ca_rows) + 1))
+
+    def test_rank(self, engine):
+        result = engine.query("""
+            SELECT order_id, total,
+                   RANK() OVER (ORDER BY total DESC) AS rnk
+            FROM orders
+        """)
+        assert len(result.rows) == 8
+        # highest total should have rank 1
+        top = min(result.rows, key=lambda r: r["rnk"])
+        assert top["rnk"] == 1
+
+    def test_dense_rank(self, engine):
+        result = engine.query("""
+            SELECT country,
+                   DENSE_RANK() OVER (ORDER BY country ASC) AS dr
+            FROM orders
+        """)
+        assert all(r["dr"] >= 1 for r in result.rows)
+
+    def test_lag(self, engine):
+        result = engine.query("""
+            SELECT order_id, total,
+                   LAG(total, 1) OVER (ORDER BY order_id ASC) AS prev_total
+            FROM orders
+        """)
+        # first row should have NULL prev_total
+        first = min(result.rows, key=lambda r: r["order_id"])
+        assert first["prev_total"] is None
+
+    def test_lead(self, engine):
+        result = engine.query("""
+            SELECT order_id, total,
+                   LEAD(total, 1) OVER (ORDER BY order_id ASC) AS next_total
+            FROM orders
+        """)
+        assert len(result.rows) == 8
+        # last row should have NULL next_total
+        last = max(result.rows, key=lambda r: r["order_id"])
+        assert last["next_total"] is None
+
+    def test_window_sum(self, engine):
+        result = engine.query("""
+            SELECT country, total,
+                   SUM(total) OVER (PARTITION BY country) AS country_total
+            FROM orders
+        """)
+        ca_rows = [r for r in result.rows if r["country"] == "CA"]
+        expected_ca_total = sum(r["total"] for r in ca_rows)
+        assert all(abs(r["country_total"] - expected_ca_total) < 0.01 for r in ca_rows)
+
+
+class TestHaving:
+    def test_having_filter(self, engine):
+        result = engine.query("""
+            SELECT country, COUNT(*) AS cnt
+            FROM orders
+            GROUP BY country
+            HAVING cnt >= 2
+        """)
+        # CA has 3, US has 2, UK has 2, DE has 1
+        assert all(r["cnt"] >= 2 for r in result.rows)
+        countries = {r["country"] for r in result.rows}
+        assert "DE" not in countries  # only 1 order
+
+    def test_having_sum(self, engine):
+        result = engine.query("""
+            SELECT country, SUM(total) AS rev
+            FROM orders
+            GROUP BY country
+            HAVING rev > 200
+        """)
+        assert all(r["rev"] > 200 for r in result.rows)
+
+
+class TestDistinct:
+    def test_select_distinct(self, engine):
+        result = engine.query("SELECT DISTINCT country FROM orders")
+        countries = [r["country"] for r in result.rows]
+        assert len(countries) == len(set(countries))  # no duplicates
+        assert set(countries) == {"CA", "US", "UK", "DE"}
+
+    def test_distinct_status(self, engine):
+        result = engine.query("SELECT DISTINCT status FROM orders")
+        statuses = [r["status"] for r in result.rows]
+        assert len(statuses) == len(set(statuses))
+
+
+class TestSample:
+    def test_sample_reduces_rows(self, tmp_csv):
+        rows = [{"id": i, "val": i} for i in range(10000)]
+        path = tmp_csv(rows)
+        from src.engine import QueryEngine
+        e = QueryEngine()
+        e.register("big", path)
+        result = e.query("SELECT * FROM big SAMPLE(10)")
+        # With 10% Bernoulli sampling, expect roughly 1000 rows ± 200
+        assert 500 < len(result.rows) < 1500
+
+    def test_sample_in_plan(self, engine):
+        plan = engine.explain("SELECT * FROM orders SAMPLE(50)")
+        assert "SAMPLE" in plan
+
+
+class TestTopK:
+    def test_topk_aggregate(self, engine):
+        result = engine.query(
+            "SELECT TOPK(country, 2) AS top_countries FROM orders"
+        )
+        assert len(result.rows) == 1
+        top = result.rows[0]["top_countries"]
+        assert "CA" in top or "US" in top  # CA and US have most orders
+
+
+class TestExplainAnalyze:
+    def test_analyze_returns_stats(self, engine):
+        result, stats = engine.analyze(
+            "SELECT * FROM orders WHERE total > 100"
+        )
+        assert stats is not None
+        assert stats.label != ""
+
+    def test_analyze_result_correct(self, engine):
+        result, stats = engine.analyze(
+            "SELECT country, COUNT(*) AS cnt FROM orders GROUP BY country"
+        )
+        assert len(result.rows) == 4  # CA, US, UK, DE
+
+    def test_stats_pretty_format(self, engine):
+        _, stats = engine.analyze("SELECT * FROM orders LIMIT 5")
+        pretty = stats.pretty()
+        assert "rows=" in pretty
+
+
+class TestBloomFilter:
+    def test_no_false_negatives(self):
+        from src.aggregation.bloom_filter import BloomFilter
+        bf = BloomFilter(expected_items=1000)
+        values = list(range(500))
+        for v in values:
+            bf.add(v)
+        # Must never miss an inserted value
+        for v in values:
+            assert bf.might_contain(v), f"False negative for {v}"
+
+    def test_false_positive_rate(self):
+        from src.aggregation.bloom_filter import BloomFilter
+        bf = BloomFilter(expected_items=1000, fp_rate=0.01)
+        for i in range(1000):
+            bf.add(f"key_{i}")
+        fp = sum(1 for i in range(1000, 5000) if bf.might_contain(f"key_{i}"))
+        fp_rate = fp / 4000
+        assert fp_rate < 0.05  # should be well below 5%
+
+    def test_bloom_join_correctness(self, tmp_csv, orders_csv):
+        # Bloom join must not drop matching rows (no false negatives)
+        labels = tmp_csv(
+            [{"order_id": i, "label": f"L{i}"} for i in range(1, 9)],
+            "labels.csv"
+        )
+        from src.engine import QueryEngine
+        e = QueryEngine()
+        e.register("orders", orders_csv)
+        e.register("labels", labels)
+        result = e.query(
+            "SELECT orders.order_id, labels.label FROM orders "
+            "INNER JOIN labels ON orders.order_id = labels.order_id"
+        )
+        assert len(result.rows) == 8  # every order has a matching label
+
+
+class TestCountMinSketch:
+    def test_frequency_estimate(self):
+        from src.aggregation.count_min_sketch import CountMinSketch
+        cms = CountMinSketch()
+        for _ in range(100):
+            cms.add("apple")
+        for _ in range(50):
+            cms.add("banana")
+        assert cms.estimate("apple") >= 100
+        assert cms.estimate("banana") >= 50
+
+    def test_topk_tracker(self):
+        from src.aggregation.count_min_sketch import TopKTracker
+        tracker = TopKTracker(k=3)
+        for _ in range(100):
+            tracker.add("apple")
+        for _ in range(80):
+            tracker.add("banana")
+        for _ in range(60):
+            tracker.add("cherry")
+        for _ in range(10):
+            tracker.add("date")
+        top = tracker.topk()
+        top_values = [v for _, v in top]
+        assert "apple" in top_values
+        assert "banana" in top_values

@@ -9,15 +9,20 @@ Key design decisions:
 """
 from __future__ import annotations
 import csv
-import io
 import json
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Generator, Optional
 from src.types import Row, Schema
 
 # Read buffer size — 64KB is a sweet spot: fits in CPU L2 cache,
 # aligns with OS page size multiples, and keeps read() syscall count low.
 BUFFER_SIZE = 64 * 1024
+
+# Parallel scan threshold: only use multiprocessing for files larger than this.
+# Below the threshold, process-startup overhead outweighs any scan speedup.
+PARALLEL_SCAN_MIN_BYTES = 32 * 1024 * 1024   # 32 MB
+PARALLEL_SCAN_WORKERS = min(4, (os.cpu_count() or 2))
 
 
 def infer_type(value: str) -> tuple[Any, str]:
@@ -125,6 +130,113 @@ class CSVReader:
             for _ in reader:
                 count += 1
         return count
+
+    def _chunk_boundaries(self, n_chunks: int) -> list[tuple[int, int]]:
+        """
+        Split the file into n_chunks byte ranges aligned on newline boundaries.
+        Returns list of (start_byte, end_byte) pairs (end_byte is exclusive).
+        The first chunk always starts after the header line.
+        """
+        file_size = os.path.getsize(self.path)
+        boundaries = []
+        with open(self.path, "rb") as f:
+            # Skip header, record where data starts
+            f.readline()
+            data_start = f.tell()
+            chunk_size = max(1, (file_size - data_start) // n_chunks)
+            start = data_start
+            for i in range(n_chunks):
+                if i == n_chunks - 1:
+                    boundaries.append((start, file_size))
+                    break
+                target = start + chunk_size
+                f.seek(target)
+                f.readline()    # advance to next newline
+                end = f.tell()
+                if end >= file_size:
+                    boundaries.append((start, file_size))
+                    break
+                boundaries.append((start, end))
+                start = end
+        return boundaries
+
+    def scan_parallel(self, columns: Optional[list[str]] = None,
+                      n_workers: int = PARALLEL_SCAN_WORKERS) -> Generator[Row, None, None]:
+        """
+        Parallel CSV scan using multiprocessing.
+
+        Splits the file into n_workers byte-range chunks, each scanned in a
+        separate process. Only beneficial for large files (>= PARALLEL_SCAN_MIN_BYTES).
+        Falls back to single-threaded scan for small files.
+        """
+        if os.path.getsize(self.path) < PARALLEL_SCAN_MIN_BYTES:
+            yield from self.scan(columns=columns)
+            return
+
+        boundaries = self._chunk_boundaries(n_workers)
+        schema = self.schema if self.infer_types else {}
+
+        # Read header once for all workers
+        with open(self.path, "r", encoding=self.encoding, newline="") as f:
+            header = next(csv.reader(f))
+
+        futures = []
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for start, end in boundaries:
+                futures.append(pool.submit(
+                    _scan_chunk,
+                    self.path, start, end, header, schema, columns, self.encoding
+                ))
+            for fut in futures:
+                yield from fut.result()
+
+
+def _scan_chunk(path: str, start: int, end: int, header: list[str],
+                schema: dict, columns: Optional[list[str]],
+                encoding: str) -> list[Row]:
+    """
+    Worker: scan a byte-range chunk of a CSV file.
+    Must be a module-level function so ProcessPoolExecutor can pickle it.
+    """
+    rows: list[Row] = []
+    with open(path, "rb") as raw:
+        raw.seek(start)
+        chunk = raw.read(end - start).decode(encoding, errors="replace")
+
+    reader = csv.reader(chunk.splitlines())
+    for fields in reader:
+        if not fields:
+            continue
+        raw_row = dict(zip(header, fields))
+        row: Row = {}
+        for key, val in raw_row.items():
+            if columns and key not in columns:
+                continue
+            if key in schema:
+                typed_val, _ = _infer_type_simple(val)
+                row[key] = typed_val
+            else:
+                row[key] = val
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _infer_type_simple(value: str):
+    """Lightweight type inference for chunk workers (avoids importing reader)."""
+    if value == "" or value.lower() in ("null", "none", "na", "n/a"):
+        return None, "null"
+    try:
+        return int(value), "int"
+    except ValueError:
+        pass
+    try:
+        return float(value), "float"
+    except ValueError:
+        pass
+    if value.lower() in ("true", "false"):
+        return value.lower() == "true", "bool"
+    return value, "str"
 
 
 class JSONLReader:

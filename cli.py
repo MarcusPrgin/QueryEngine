@@ -34,9 +34,19 @@ HELP = """
     .indexes             list built indexes
     .index <t> <col>     build index on table.column
     .explain <sql>       show query plan without executing
+    .analyze <sql>       run query and show per-node timing (EXPLAIN ANALYZE)
     .plan                toggle showing plan before each query
     help                 show this message
     exit / quit          exit the REPL
+
+  New SQL features:
+    WITH cte AS (SELECT ...) SELECT * FROM cte      -- Common Table Expressions
+    SELECT DISTINCT country FROM orders             -- deduplication
+    SELECT * FROM orders SAMPLE(10)                 -- 10% Bernoulli sample
+    SELECT * FROM orders HAVING SUM(total) > 100    -- post-aggregate filter
+    SELECT ROW_NUMBER() OVER (PARTITION BY country
+           ORDER BY total DESC) AS rn FROM orders   -- window functions
+    SELECT TOPK(country, 3) AS top FROM orders      -- approximate top-k
 """
 
 
@@ -98,6 +108,16 @@ def repl(engine: QueryEngine):
         if line.startswith(".explain "):
             sql = line[9:]
             print(engine.explain(sql))
+            continue
+        if line.startswith(".analyze "):
+            sql = line[9:]
+            try:
+                result, stats = engine.analyze(sql)
+                print(result.pretty())
+                print("\nEXPLAIN ANALYZE:")
+                print(stats.pretty())
+            except Exception as e:
+                print(f"Error: {e}")
             continue
         if line == ".plan":
             show_plan = not show_plan

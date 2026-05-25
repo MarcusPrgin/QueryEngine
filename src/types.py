@@ -30,6 +30,7 @@ class TokenType(Enum):
     WHERE     = auto()
     GROUP_BY  = auto()
     ORDER_BY  = auto()
+    PARTITION_BY = auto()
     LIMIT     = auto()
     AND       = auto()
     OR        = auto()
@@ -39,10 +40,16 @@ class TokenType(Enum):
     ON        = auto()
     INNER     = auto()
     LEFT      = auto()
+    WITH      = auto()
+    OVER      = auto()
+    HAVING    = auto()
+    DISTINCT  = auto()
+    SAMPLE    = auto()
     # operators
     EQ = auto(); NEQ = auto(); LT = auto(); LTE = auto()
     GT = auto(); GTE = auto(); LIKE = auto()
     PLUS = auto(); MINUS = auto(); STAR = auto(); SLASH = auto()
+    PERCENT = auto()
     # punctuation
     LPAREN = auto(); RPAREN = auto(); COMMA = auto()
     DOT    = auto(); SEMICOLON = auto()
@@ -98,11 +105,19 @@ class UnaryOp:
 
 
 @dataclass
+class WindowSpec:
+    """OVER (PARTITION BY ... ORDER BY ...) clause attached to a window function."""
+    partition_by: list[Any] = field(default_factory=list)
+    order_by: list[tuple[Any, str]] = field(default_factory=list)
+
+
+@dataclass
 class FunctionCall:
-    name: str   # "SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT"
+    name: str   # "SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT", "TOPK"
     args: list[Any]
     is_aggregate: bool = False
     alias: Optional[str] = None
+    over: Optional[WindowSpec] = None   # set when OVER (...) follows the call
 
 
 @dataclass
@@ -114,6 +129,10 @@ class SelectStatement:
     order_by: list[tuple[Any, str]] = field(default_factory=list)  # (expr, "ASC"|"DESC")
     limit: Optional[int] = None
     joins: list["JoinClause"] = field(default_factory=list)
+    ctes: list[tuple[str, "SelectStatement"]] = field(default_factory=list)
+    having: Optional[Any] = None
+    distinct: bool = False
+    sample_pct: Optional[float] = None   # FROM t SAMPLE(10) → 10% Bernoulli sample
 
 
 @dataclass
@@ -131,10 +150,12 @@ class Scan:
     source: str            # file path or table name
     columns: list[str]     # projected columns (empty = all)
     alias: Optional[str] = None
+    sample_pct: Optional[float] = None   # Bernoulli sample percentage (0–100)
 
     def __str__(self):
         cols = ", ".join(self.columns) if self.columns else "*"
-        return f"Scan({self.source}, [{cols}])"
+        suffix = f", SAMPLE({self.sample_pct}%)" if self.sample_pct is not None else ""
+        return f"Scan({self.source}, [{cols}]{suffix})"
 
 
 @dataclass
@@ -198,6 +219,54 @@ class HashJoin:
 
     def __str__(self):
         return f"HashJoin({self.join_type}, {self.condition})\n  {self.left}\n  {self.right}"
+
+
+@dataclass
+class Window:
+    """Window functions: ROW_NUMBER, RANK, LAG, running aggregates, etc."""
+    child: Any
+    functions: list[tuple[str, FunctionCall]]  # (output_col_name, func_with_over)
+
+    def __str__(self):
+        fns = ", ".join(f"{n}={f.name}()" for n, f in self.functions)
+        return f"Window([{fns}])\n  {self.child}"
+
+
+@dataclass
+class Distinct:
+    """Deduplicate rows based on all projected columns."""
+    child: Any
+
+    def __str__(self):
+        return f"Distinct\n  {self.child}"
+
+
+# ── EXPLAIN ANALYZE result ─────────────────────────────────────────────────
+
+@dataclass
+class NodeStats:
+    """Per-node execution statistics collected during EXPLAIN ANALYZE."""
+    label: str
+    rows_in: int = 0
+    rows_out: int = 0
+    elapsed_ms: float = 0.0
+    children: list["NodeStats"] = field(default_factory=list)
+
+    def pretty(self, indent: int = 0) -> str:
+        prefix = "  " * indent
+        ratio = f"{self.rows_out / self.rows_in * 100:.0f}%" if self.rows_in else "—"
+        line = (
+            f"{prefix}{self.label}"
+            f"  rows={self.rows_out:,}  selectivity={ratio}"
+            f"  time={self.elapsed_ms:.1f}ms"
+        )
+        lines = [line]
+        for child in self.children:
+            lines.append(child.pretty(indent + 1))
+        return "\n".join(lines)
+
+    def total_elapsed_ms(self) -> float:
+        return self.elapsed_ms + sum(c.total_elapsed_ms() for c in self.children)
 
 
 # ── Result type ────────────────────────────────────────────────────────────

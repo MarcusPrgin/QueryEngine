@@ -1,29 +1,32 @@
 """
 Recursive descent parser.
 
-Converts a flat token list into a structured AST (SelectStatement).
-Each parse_* method consumes tokens and returns an AST node.
-
 Grammar (simplified):
-  select_stmt := SELECT select_list FROM ident [join_clause*]
-                 [WHERE expr] [GROUP BY expr_list]
-                 [ORDER BY order_list] [LIMIT number]
+  statement   := [with_clause] select_stmt
+  with_clause := WITH cte (, cte)*
+  cte         := ident AS ( select_stmt )
+  select_stmt := SELECT [DISTINCT] select_list FROM ident [SAMPLE(n)]
+                 [join_clause*] [WHERE expr] [GROUP BY expr_list]
+                 [HAVING expr] [ORDER BY order_list] [LIMIT number]
   select_list := * | expr (AS ident)? (, expr (AS ident)?)*
   expr        := comparison (AND|OR comparison)*
-  comparison  := additive (=|!=|<|<=|>|>= additive)?
+  comparison  := additive (=|!=|<|<=|>|>= additive)? [NOT? LIKE string]
   additive    := multiplicative (+|- multiplicative)*
   multiplicative := unary (*|/ unary)*
   unary       := NOT? primary
-  primary     := number | string | ident | func_call | (expr)
+  primary     := number | string | ident | func_call [OVER window_spec] | (expr)
+  window_spec := ( [PARTITION BY expr_list] [ORDER BY order_list] )
 """
 from __future__ import annotations
 from src.types import (
     Token, TokenType, Column, Star, Literal, BinaryOp, UnaryOp,
-    FunctionCall, SelectStatement, JoinClause
+    FunctionCall, SelectStatement, JoinClause, WindowSpec
 )
 from src.parser.lexer import tokenize
 
-AGGREGATE_FUNCTIONS = {"sum", "count", "avg", "min", "max", "count_distinct"}
+AGGREGATE_FUNCTIONS = {"sum", "count", "avg", "min", "max", "count_distinct", "topk"}
+WINDOW_FUNCTIONS = {"row_number", "rank", "dense_rank", "lag", "lead", "ntile",
+                    "sum", "avg", "min", "max", "count", "first_value", "last_value"}
 
 
 class ParseError(Exception):
@@ -63,10 +66,60 @@ class Parser:
     # ── Entry point ────────────────────────────────────────────────────────
 
     def parse(self) -> SelectStatement:
+        ctes = []
+        if self.match(TokenType.WITH):
+            ctes = self.parse_with_clause()
+        stmt = self.parse_select()
+        stmt.ctes = ctes
+        return stmt
+
+    # ── WITH / CTEs ────────────────────────────────────────────────────────
+
+    def parse_with_clause(self) -> list[tuple[str, SelectStatement]]:
+        self.expect(TokenType.WITH)
+        ctes = [self._parse_one_cte()]
+        while self.match(TokenType.COMMA):
+            self.advance()
+            ctes.append(self._parse_one_cte())
+        return ctes
+
+    def _parse_one_cte(self) -> tuple[str, SelectStatement]:
+        name = self.expect(TokenType.IDENT).value
+        self.expect(TokenType.AS)
+        self.expect(TokenType.LPAREN)
+        stmt = self.parse_select()
+        self.expect(TokenType.RPAREN)
+        return (name, stmt)
+
+    # ── SELECT statement ───────────────────────────────────────────────────
+
+    def parse_select(self) -> SelectStatement:
         self.expect(TokenType.SELECT)
+
+        distinct = False
+        if self.match(TokenType.DISTINCT):
+            self.advance()
+            distinct = True
+
         columns = self.parse_select_list()
         self.expect(TokenType.FROM)
         from_table = self.expect(TokenType.IDENT).value
+
+        # SAMPLE(n) or SAMPLE n
+        sample_pct = None
+        if self.match(TokenType.SAMPLE):
+            self.advance()
+            if self.match(TokenType.LPAREN):
+                self.advance()
+                sample_pct = float(self.expect(TokenType.NUMBER).value)
+                # optional % sign
+                if self.match(TokenType.PERCENT):
+                    self.advance()
+                self.expect(TokenType.RPAREN)
+            else:
+                sample_pct = float(self.expect(TokenType.NUMBER).value)
+                if self.match(TokenType.PERCENT):
+                    self.advance()
 
         joins = []
         while self.match(TokenType.INNER, TokenType.LEFT, TokenType.JOIN):
@@ -81,6 +134,11 @@ class Parser:
         if self.match(TokenType.GROUP_BY):
             self.advance()
             group_by = self.parse_expr_list()
+
+        having = None
+        if self.match(TokenType.HAVING):
+            self.advance()
+            having = self.parse_expr()
 
         order_by = []
         if self.match(TokenType.ORDER_BY):
@@ -100,6 +158,9 @@ class Parser:
             order_by=order_by,
             limit=limit,
             joins=joins,
+            having=having,
+            distinct=distinct,
+            sample_pct=sample_pct,
         )
 
     # ── Select list ────────────────────────────────────────────────────────
@@ -123,7 +184,7 @@ class Parser:
         if isinstance(expr, Column) and alias:
             expr.alias = alias
         elif isinstance(expr, FunctionCall) and alias:
-            expr.alias = alias  # type: ignore[attr-defined]
+            expr.alias = alias
         elif alias:
             expr = Column(name=str(expr), alias=alias)
         return expr
@@ -238,7 +299,13 @@ class Parser:
                 else:
                     args = self.parse_expr_list()
                 self.expect(TokenType.RPAREN)
-                return FunctionCall(name=name.upper(), args=args, is_aggregate=is_agg)
+                func = FunctionCall(name=name.upper(), args=args, is_aggregate=is_agg)
+                # window function: check for OVER (...)
+                if self.match(TokenType.OVER):
+                    self.advance()
+                    func.over = self.parse_window_spec()
+                    func.is_aggregate = False  # window fns are not group aggregates
+                return func
             # table.column reference?
             if self.match(TokenType.DOT):
                 self.advance()
@@ -250,7 +317,25 @@ class Parser:
             self.advance()
             return Star()
 
-        raise self.error(f"Unexpected token in expression")
+        raise self.error("Unexpected token in expression")
+
+    # ── Window spec ────────────────────────────────────────────────────────
+
+    def parse_window_spec(self) -> WindowSpec:
+        """Parse OVER (PARTITION BY ... ORDER BY ...)."""
+        self.expect(TokenType.LPAREN)
+        partition_by = []
+        order_by = []
+        if self.match(TokenType.PARTITION_BY):
+            self.advance()
+            partition_by = self.parse_expr_list()
+        if self.match(TokenType.ORDER_BY):
+            self.advance()
+            order_by = self.parse_order_list()
+        self.expect(TokenType.RPAREN)
+        return WindowSpec(partition_by=partition_by, order_by=order_by)
+
+    # ── Helpers ────────────────────────────────────────────────────────────
 
     def parse_expr_list(self) -> list:
         items = [self.parse_expr()]

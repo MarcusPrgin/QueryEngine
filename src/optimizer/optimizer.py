@@ -18,7 +18,7 @@ I can show two query plans for the same SQL: before and after optimization."
 from __future__ import annotations
 from src.types import (
     Scan, Filter, Project, Aggregate, Sort, Limit, HashJoin,
-    BinaryOp, Column, FunctionCall, Star
+    Window, Distinct, BinaryOp, Column, FunctionCall, Star
 )
 
 
@@ -79,6 +79,12 @@ def pushdown_predicates(plan):
             condition=plan.condition,
             join_type=plan.join_type,
         )
+
+    elif isinstance(plan, Window):
+        return Window(child=pushdown_predicates(plan.child), functions=plan.functions)
+
+    elif isinstance(plan, Distinct):
+        return Distinct(child=pushdown_predicates(plan.child))
 
     return plan  # Scan — nothing to push down further
 
@@ -174,6 +180,12 @@ def prune_projections(plan):
             condition=plan.condition,
             join_type=plan.join_type,
         )
+
+    elif isinstance(plan, Window):
+        return Window(child=prune_projections(plan.child), functions=plan.functions)
+
+    elif isinstance(plan, Distinct):
+        return Distinct(child=prune_projections(plan.child))
 
     return plan
 
